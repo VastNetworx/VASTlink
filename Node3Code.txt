@@ -1,0 +1,832 @@
+  // NODE 3
+  
+  #include <Arduino.h>
+  #include "painlessMesh.h"
+  #include "VAST_logo.h"
+  #include <TFT_eSPI.h>
+
+  // KNOWN IDs
+  uint32_t node1 = 197400837;
+  uint32_t node2 = 197400453;
+  uint32_t node3 = 197403941;
+
+  #define   MESH_PREFIX       "VastNetworx"
+  #define   MESH_PASSWORD     "12345678910"
+  #define   MESH_PORT         5555
+
+  #define IS_ROOT false // Establishes roots to speed up connection time
+
+  Scheduler userScheduler; // to control tasks
+  painlessMesh    mesh; // creates object "mesh"
+
+  // PINS
+  #define IR_RX_PIN 27  // IR demod receiver output
+  #define PIN_COMM_IN 39 // ONLY INPUT: If high, COMM state
+  #define PIN_SNIFF_IN_TX_OUT 25 // INPUT/OUTPUT: if input high, SNIFFER state, if output, interference TX output
+  #define PIN_INTER_IN_SNIFF_OUT 12 // INPUT/OUTPUT: if input high, INTERFERENCE state, if output, Sniffer LED output
+  #define LED_BRUH 16 // Received IR interference LED
+  #define PIN_INTERACT 35
+  #define PIN_UP 36
+  #define PIN_SELECTION 34
+  #define PIN_AUD_RECIEVE_LED_SNIFFER 33
+  #define PIN_LEFT 23
+  #define PIN_DOWN 19
+  #define PIN_RIGHT 18
+  #define PIN_LED_SNIFFER 3
+  #define PIN_LED_COMMS 1
+  #define PIN_LED_MESSAGING 0
+  #define PIN_LED_INTERFERENCE 2
+  #define PIN_TEST 14
+  #define TFT_BL 4  // backlight pin for LCD
+
+  //LCD Configuration
+  TFT_eSPI tft = TFT_eSPI(); // uses pins from User_Setup (Arduino) or build_flags (PIO)
+  static const uint16_t BG = TFT_BLACK;
+  static const uint16_t FG = TFT_WHITE;
+  int W;
+  int H;
+  int x;
+  int y;
+
+  // IR Configuration
+  #define IR_SUPPRESS_MS 6000    // how long to stay in IDLE when IR detected
+  #define IR_DEBOUNCE_MS 2000    // ignore further IR triggers for this many ms
+  volatile uint32_t edges = 0;
+  static uint32_t lastCheck = 0; // Variables for finding trigger state
+  static uint32_t lastIrTrigger = 0; 
+  const int IR_CH = 0;
+  void IRAM_ATTR onIrEdge() {edges++;} // Counts falling edges
+
+  struct SuppressTimer { // Interference Timer
+    bool     active = false;
+    uint32_t until  = 0;        // millis() when suppression ends
+  } suppress;
+
+  // --- STATE MACHINE CONFIGURATION ---
+  enum class MeshState : uint8_t {
+    Messaging,       // default: allows updates of mesh network
+    Sniffer,          
+    Comms,           
+    Interference, 
+    Idle     
+  };
+
+  volatile MeshState requestState = MeshState::Idle;  // set by Serial/GPIO but starts as IDLE which is MESSAGING
+  MeshState currentState = MeshState::Idle;           // applied in loop but starts as IDLE which is MESSAGING
+  static MeshState lastApplied = MeshState::Idle;
+
+  // TASK FUNCTIONS
+
+  void wordOutline(const char *line, int32_t x, int32_t y) {
+    tft.setTextSize(5);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString(line, x, y + 2);
+    tft.drawString(line, x, y - 2);
+    tft.drawString(line, x + 2, y);
+    tft.drawString(line, x - 2, y);
+    tft.drawString(line, x + 2, y + 2);
+    tft.drawString(line, x + 2, y - 2);
+    tft.drawString(line, x - 2, y + 2);
+    tft.drawString(line, x - 2, y - 2);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString(line, x, y);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(2);
+  }
+
+  bool buffer = false;
+
+  void stateMachine() { // GPIO State Machine Implementation
+    if (suppress.active) return;
+
+    static uint32_t last = 0;
+    uint32_t now = millis();
+    if (now - last < 150) return;  // ~60 ms debounce
+    last = now;
+
+    int comm = analogRead(PIN_COMM_IN);
+    bool snifferPin = digitalRead(PIN_SNIFF_IN_TX_OUT);
+    bool interferencePin = digitalRead(PIN_INTER_IN_SNIFF_OUT);
+
+    if (buffer && comm < 600) {
+      requestState = MeshState::Messaging; 
+      buffer = false; // Buffer for interference state stutter
+      return;
+    }
+
+    if (comm > 600) { // Comms connected?
+      requestState = MeshState::Comms;
+      buffer = true;
+    } else if (!snifferPin && currentState != MeshState::Sniffer && interferencePin && comm < 600) { // Interference Connected?
+      requestState = MeshState::Interference; // Also checks to make sure Pin is not output (in sniffer state)
+    } else if (!interferencePin && currentState != MeshState::Interference && snifferPin) { // Sniffer Connected?
+      requestState = MeshState::Sniffer; // Also checks to make sure pin is input (in interference state)
+    } else {
+      requestState = MeshState::Messaging;
+    } 
+  }
+
+  void interferenceGraphic() {
+    int cx = tft.width() / 2;
+    int cy = tft.height() / 2;
+    int size;
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);         // Middle-Center anchor
+    size = 125;
+    tft.fillTriangle(cx, cy - size - 30, cx - size, cy + size - 30, cx + size, cy + size - 30, TFT_YELLOW);
+    size = 127;
+    tft.fillTriangle(cx, cy - size - 30, cx - size, cy + size - 30, cx + size, cy + size - 30, TFT_BLACK);
+    size = 125;
+    tft.fillTriangle(cx, cy - size - 30, cx - size, cy + size - 30, cx + size, cy + size - 30, TFT_RED);
+    tft.drawWideLine(cx, cy - 110, cx, cy + 30, 14, TFT_BLACK);
+    tft.drawWideLine(cx, cy - 110, cx, cy + 30, 12, TFT_YELLOW);
+    tft.fillCircle(cx, cy + 75, 10, TFT_BLACK);
+    tft.fillCircle(cx, cy + 75, 8, TFT_YELLOW);
+    wordOutline("Interference", tft.width()/2, (tft.height()/2)- 30);
+    tft.setTextDatum(TL_DATUM); // resets cursor
+    tft.setTextSize(2);
+    tft.setCursor(15,tft.height() - 40);
+    tft.println("Press the Interact Button to INTERFERE");
+  }
+  
+  void snifferGraphic() {
+    int cx = tft.width() / 2;
+    int cy = tft.height() / 2;
+    tft.fillScreen(TFT_BLACK);
+    tft.drawCircle(cx, cy, 20, TFT_CYAN);
+    tft.drawCircle(cx, cy, 60, TFT_CYAN);
+    tft.drawCircle(cx, cy, 120, TFT_CYAN);
+    tft.drawCircle(cx, cy, 160, TFT_CYAN);
+    tft.drawLine(cx, cy, cx + 200*cos(radians(270)), cy + 200*sin(radians(270)), TFT_GREEN);
+    tft.fillCircle(cx + random(0,130), cy + random(0,130), 5, TFT_GREEN);
+    tft.fillCircle(cx - random(0,130), cy - random(0,130), 5, TFT_GREEN);
+    tft.fillCircle(cx - random(0,130), cy + random(0,130), 5, TFT_GREEN);
+    tft.fillCircle(cx + random(0,130), cy - random(0,130), 5, TFT_GREEN);
+    wordOutline("Signal Sniffer", tft.width()/2, tft.height()/2);
+    tft.setTextDatum(TL_DATUM); // resets cursor
+    tft.setCursor(0,0);
+    tft.setTextSize(2);
+  }
+  
+  void messagingGraphic() {
+    tft.setTextDatum(MC_DATUM);
+    tft.fillScreen(TFT_BLACK);
+    int x = 80, y = 10, w = 320, h = 110;
+
+    tft.fillRoundRect(x, y, w, h, 20, TFT_GREEN);
+    tft.fillTriangle(x + 40, y + h, x + 70, y + h, x + 55, y + h + 20, TFT_GREEN);
+    wordOutline("Messaging", 240, 65);
+    tft.setTextDatum(TL_DATUM); // resets cursor
+    tft.setCursor(0,0);
+    tft.setTextSize(2);
+  }
+
+  void commsGraphic() {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.fillRect(60, 100, 40, 20, TFT_CYAN);
+    tft.fillRect(140, 80, 40, 40, TFT_CYAN);
+    tft.fillRect(220, 60, 40, 60, TFT_CYAN);
+    tft.fillRect(300, 40, 40, 80, TFT_CYAN);
+    tft.fillRect(380, 20, 40, 100, TFT_CYAN);
+    wordOutline("Communications", 240, 65);
+    tft.setTextDatum(TL_DATUM); // resets cursor
+    tft.setCursor(0,0);
+    tft.setTextSize(2);
+  }
+  
+  void interferedGraphic() {
+    int cx = tft.width() / 2;
+    int cy = tft.height() / 2;
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);         // Middle-Center anchor
+    tft.fillCircle(cx, cy, 150, TFT_YELLOW);
+    tft.fillCircle(cx + 55, cy - 50, 8, TFT_BLACK);
+    tft.fillCircle(cx - 55, cy - 50, 8, TFT_BLACK);
+    tft.fillCircle(cx, cy + 50, 60, TFT_BLACK);
+    
+    tft.setTextSize(3);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_BLACK);
+    tft.drawString("YOU JUST GOT INTERFERED", cx, cy + 2);
+    tft.drawString("YOU JUST GOT INTERFERED", cx, cy - 2);
+    tft.drawString("YOU JUST GOT INTERFERED", cx + 2, cy);
+    tft.drawString("YOU JUST GOT INTERFERED", cx - 2, cy);
+    tft.drawString("YOU JUST GOT INTERFERED", cx + 2, cy + 2);
+    tft.drawString("YOU JUST GOT INTERFERED", cx + 2, cy - 2);
+    tft.drawString("YOU JUST GOT INTERFERED", cx - 2, cy + 2);
+    tft.drawString("YOU JUST GOT INTERFERED", cx - 2, cy - 2);
+    tft.setTextColor(TFT_WHITE);
+    tft.drawString("YOU JUST GOT INTERFERED", cx, cy); 
+
+    tft.setTextDatum(TL_DATUM); // resets cursor
+    tft.setCursor(0,0);
+    tft.setTextSize(2);
+  }
+  
+  uint32_t nodeId = 0;
+  String message = "EMPTY"; 
+  int messState = 0;
+
+  void sendMessage() { 
+    if (messState == 0) {  
+      if (digitalRead(PIN_SELECTION)) {
+        messagingGraphic();
+        nodeId = node1;
+        tft.setTextDatum(TL_DATUM);
+        tft.setCursor(15,tft.height() - 160);
+        tft.println("Choose a Messaging Option:");
+        tft.println("Up:\n Hello World!");
+        tft.println("Right:\n This is a robot messaging you!");
+        tft.println("Down:\n Somebody help me!");
+        tft.println();
+        tft.println("Press Left to start over.");
+        messState = 1;
+      }
+      if (digitalRead(PIN_INTERACT)) {
+        messagingGraphic();
+        nodeId = node2;
+        tft.setTextDatum(TL_DATUM);
+        tft.setCursor(15,tft.height() - 160);
+        tft.println("Choose a Messaging Option:");
+        tft.println("Up:\n Hello World!");
+        tft.println("Right:\n This is a robot messaging you!");
+        tft.println("Down:\n Somebody help me!");
+        tft.println();
+        tft.println("Press Left to start over.");
+        messState = 1;
+      }
+      if (digitalRead(PIN_LEFT)) {
+        messState = 0;
+        message = "EMPTY";
+        nodeId = 0;
+        messagingGraphic();
+        tft.setTextDatum(TL_DATUM); // resets cursor
+        tft.setTextSize(2);
+        tft.setCursor(0,tft.height() - 160);
+        tft.println("Press the Selection Button to send a \nmessage to Node 1");
+        tft.println("Press the Interact Button to send a \nmessage to Node 2");
+        return;
+      }
+    }
+    
+    if (messState == 1) {
+      if (digitalRead(PIN_LEFT)) {
+        messState = 0;
+        message = "EMPTY";
+        nodeId = 0;
+        messagingGraphic();
+        tft.setTextDatum(TL_DATUM); // resets cursor
+        tft.setTextSize(2);
+        tft.setCursor(0,tft.height() - 160);
+        tft.println("Press the Selection Button to send a \nmessage to Node 1");
+        tft.println("Press the Interact Button to send a \nmessage to Node 2");
+        return;
+      }
+      if (digitalRead(PIN_UP)) {
+        message = "Hello World!";
+        messState = 2;
+      }
+      if (digitalRead(PIN_RIGHT)) {
+        message = "This is a robot messaging you!";
+        messState = 2;
+      }
+      if (digitalRead(PIN_DOWN)) {
+        message = "Somebody help me!";
+        messState = 2;
+      }
+    }
+
+    if (messState < 2) {return;} // Makes sure that message is chosen
+
+    if (messState == 2) {
+      // Encryption for Sniffer logic 
+      String eMessage = message;
+      for (int i = 0; i < message.length(); i++) {
+        char c = message[i];
+        if (c >= 'A' && c <= 'Z') {
+          c = 'A' + ( (c - 'A' + 1) % 26 );  // shift + wrap
+        } else if (c >= 'a' && c <= 'z') {
+          c = 'a' + ( (c - 'a' + 1) % 26 );
+        }
+        eMessage.setCharAt(i, c);
+      }
+      String pkt = String(nodeId) + "|" + eMessage + "| from:" + String(mesh.getNodeId()); // header: to|payload|from
+
+      // Send message
+      mesh.sendBroadcast(pkt);
+      
+      messagingGraphic();
+      tft.setTextDatum(TL_DATUM);
+      tft.setCursor(15,tft.height() - 160);
+      tft.println("Your message has been sent!");
+      tft.println();
+      tft.println("Press Left to start over.");
+      messState = 3;
+    }
+
+    if (messState == 3 && digitalRead(PIN_LEFT)) {
+      messState = 0;
+      message = "EMPTY";
+      nodeId = 0;
+      messagingGraphic();
+      tft.setTextDatum(TL_DATUM); // resets cursor
+      tft.setTextSize(2);
+      tft.setCursor(0,tft.height() - 160);
+      tft.println("Press the Selection Button to send a \nmessage to Node 1");
+      tft.println("Press the Interact Button to send a \nmessage to Node 2");
+    }
+  }
+
+  void snifferAttachment() {
+    // Literally do nothing
+  };
+
+  uint32_t nodeIdComms = 0;
+  String messageComms = "EMPTY"; 
+  int commState = 0;
+
+  void commsAttachment() { 
+    if (commState == 0) {  
+      if (digitalRead(PIN_SELECTION)) {
+        commsGraphic();
+        nodeIdComms = node1;
+        tft.setTextDatum(TL_DATUM);
+        tft.setCursor(15,tft.height() - 160);
+        tft.println("Choose a Messaging Option:");
+        tft.println("Up:\n And I'm Stephen!");
+        tft.println("Right:\n Who? What? Where?");
+        tft.println("Down:\n I see, said the blind man");
+        tft.println();
+        tft.println("Press Left to start over.");
+        commState = 1;
+      }
+      if (digitalRead(PIN_INTERACT)) {
+        commsGraphic();
+        nodeIdComms = node2;
+        tft.setTextDatum(TL_DATUM);
+        tft.setCursor(15,tft.height() - 160);
+        tft.println("Choose a Messaging Option:");
+        tft.println("Up:\n And I'm Stephen!");
+        tft.println("Right:\n Who? What? Where?");
+        tft.println("Down:\n I see, said the blind man");
+        tft.println();
+        tft.println("Press Left to start over.");
+        commState = 1;
+      }
+      if (digitalRead(PIN_LEFT)) {
+        commState = 0;
+        messageComms = "EMPTY";
+        nodeIdComms = 0;
+        commsGraphic();
+        tft.setTextDatum(TL_DATUM); // resets cursor
+        tft.setTextSize(2);
+        tft.setCursor(0,tft.height() - 160);
+        tft.println("Press the Selection Button to send a \nmessage to Node 1");
+        tft.println("Press the Interact Button to send a \nmessage to Node 2");
+        return;
+      }
+    }
+    
+    if (commState == 1) {
+      if (digitalRead(PIN_LEFT)) {
+        commState = 0;
+        messageComms = "EMPTY";
+        nodeIdComms = 0;
+        commsGraphic();
+        tft.setTextDatum(TL_DATUM); // resets cursor
+        tft.setTextSize(2);
+        tft.setCursor(0,tft.height() - 160);
+        tft.println("Press the Selection Button to send a \nmessage to Node 1");
+        tft.println("Press the Interact Button to send a \nmessage to Node 2");
+        return;
+      }
+      if (digitalRead(PIN_UP)) {
+        messageComms = "And I'm Stephen!";
+        commState = 2;
+      }
+      if (digitalRead(PIN_RIGHT)) {
+        messageComms = "Who? What? Where?";
+        commState = 2;
+      }
+      if (digitalRead(PIN_DOWN)) {
+        messageComms = "I see, said the blind man";
+        commState = 2;
+      }
+    }
+
+    int comm = analogRead(PIN_COMM_IN);
+
+    if (commState == 2) {
+      int j = 0;
+      if (comm > 500 && comm < 1000) { // POOR QUALITY
+        for (int i = 1; i < messageComms.length() - 1; i++) {
+          if (messageComms[i] == ' ') {
+              continue;
+            }
+          if (random(0,100) < 90) { // 90% chance of scrambling letter for every letter in phrase
+            messageComms[i] = 65 + ((messageComms[i] + rand()) % 57);
+          }
+        }
+        commState = 3;
+      } else if (comm >= 2500) { // OK QUALITY
+        for (int i = 1; i < messageComms.length() - 1; i++) {
+          if (messageComms[i] == ' ') {
+              continue;
+            }
+          if (random(0,100) < 20) { // 20% chance of scrambling letter for every letter in phrase
+            messageComms[i] = 65 + ((messageComms[i] + rand()) % 57);
+          }
+        }
+        commState = 3;
+      } else if (comm > 1000 && comm < 2000) { // GOOD QUALITY
+        commState = 3;
+      }
+    }
+
+    if (commState < 3) {return;} // Makes sure that message is chosen
+
+
+    if (commState == 3) {
+      // Encryption for Sniffer logic 
+      String eMessageComms = messageComms;
+      for (int i = 0; i < messageComms.length(); i++) {
+        char c = messageComms[i];
+        if (c >= 'A' && c <= 'Z') {
+          c = 'A' + ( (c - 'A' + 1) % 26 );  // shift + wrap
+        } else if (c >= 'a' && c <= 'z') {
+          c = 'a' + ( (c - 'a' + 1) % 26 );
+        }
+        eMessageComms.setCharAt(i, c);
+      }
+      String pktComms = String(nodeIdComms) + "|" + eMessageComms + "| from:" + String(mesh.getNodeId()); // header: to|payload|from
+
+      // Send message
+      mesh.sendBroadcast(pktComms);
+      commsGraphic();
+      tft.setTextDatum(TL_DATUM);
+      tft.setCursor(15,tft.height() - 160);
+      tft.println("Your message has been sent!");
+      tft.println();
+      tft.println("Press Left to start over.");
+      commState = 4;
+    }
+
+    if (commState == 4 && digitalRead(PIN_LEFT)) {
+      commState = 0;
+      messageComms = "EMPTY";
+      nodeIdComms = 0;
+      commsGraphic();
+      tft.setTextDatum(TL_DATUM); // resets cursor
+      tft.setTextSize(2);
+      tft.setCursor(0,tft.height() - 160);
+      tft.println("Press the Selection Button to send a \nmessage to Node 1");
+      tft.println("Press the Interact Button to send a \nmessage to Node 2");
+    }
+  };
+
+  void interferenceAttachment() {
+    // Interference functionality
+    // When in INTERFERENCE, IR Transmitter is enabled on Interact
+    static bool on;
+    static uint32_t t;
+    uint32_t now;
+    if (digitalRead(PIN_INTERACT)) {
+      on = false;
+      t = 0;
+      now = micros();
+      if (on && (now - t) >= 600) {          // 600 µs ON done
+        ledcWrite(IR_CH, 0);                 // carrier off
+        on = false; t = now;  
+      } else if (!on && (now - t) >= 600) {  // 600 µs OFF done
+        ledcWrite(IR_CH, 85);                // ~33% duty carrier on   
+        on = true; t = now;
+      }
+    } else {
+      ledcWrite(IR_CH, 0); // ensures IR LED turns off after use
+      on = false;
+      t = now;
+    }
+  };
+
+  int trigger = 0;
+
+  void irCheck() {
+    // Checks status of IR receiever
+    if (millis() - lastCheck >= 50) {
+      lastCheck = millis();
+
+      noInterrupts();
+      uint32_t count = edges;                     
+      edges = 0;
+      interrupts();
+
+      if (currentState == MeshState::Interference) return;// Avoids self-trigger suppression while transmitting
+
+      if (count > 20) {
+        if (trigger < 255) trigger++;
+      } else {
+        if (trigger > 0) trigger--;
+      }
+
+      // threshold for trigger
+      if (trigger > 5 && !suppress.active) {
+        uint32_t now = millis();
+        if ((int32_t)(now - lastIrTrigger) >= IR_DEBOUNCE_MS && !suppress.active) {
+          lastIrTrigger = now;
+          suppress.active = true;
+          suppress.until  = now + IR_SUPPRESS_MS;
+          requestState    = MeshState::Idle;
+          digitalWrite(LED_BRUH, HIGH);
+          interferedGraphic();
+        }
+      }
+    }
+  };
+
+  // LIST OF TASKS
+
+  Task taskMessaging( TASK_MILLISECOND * 100 , TASK_FOREVER, &sendMessage );
+  Task taskSniffer( TASK_MILLISECOND * 100, TASK_FOREVER, &snifferAttachment);
+  Task taskComms( TASK_MILLISECOND * 1, TASK_FOREVER, &commsAttachment);
+  Task taskInterference( TASK_MILLISECOND * 1, TASK_FOREVER, &interferenceAttachment);
+  Task taskIrCheck( TASK_MILLISECOND * 100, TASK_FOREVER, &irCheck);
+
+  String fromNode = ""; // String for Node ID of sender
+
+  void receivedCallback( uint32_t from, String &msg ) {
+    int p = msg.indexOf('|');
+    if (p < 0) {
+      return;
+    }
+
+    if (from == 197400837) {
+      fromNode = "Node 1";
+    } else if (from == 197400453) {
+      fromNode = "Node 2";
+    } else if (from == 197403941) {
+      fromNode = "Node 3";
+    }
+
+    String toStr = msg.substring(0, p);
+    String rest  = msg.substring(p+1);
+
+    uint32_t toId = (uint32_t) strtoul(toStr.c_str(), nullptr, 10);
+
+    if (rest.endsWith("|")) rest.remove(rest.length() - 1); // removes trailing '|' in rest variable
+
+    rest.remove(rest.length()-16); // remove 16 characters at the end (Removes trailing data for processing but not wanted for printing)
+
+    // Sniffer logs everything (if in sniffer state)
+    if (currentState == MeshState::Sniffer) {
+      snifferGraphic();
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextSize(2);
+      tft.setCursor(15, 30);
+      digitalWrite(PIN_AUD_RECIEVE_LED_SNIFFER, HIGH);
+      tft.printf("To= %u\nFrom= %s\npayload= %s\nTimestamp=%u\n", toId, fromNode, rest.c_str(), millis());
+      digitalWrite(PIN_AUD_RECIEVE_LED_SNIFFER, LOW);
+    }
+
+    // If this packet is not for me, ignore further processing
+    if (toId != mesh.getNodeId()) return;
+
+
+    int p2 = rest.indexOf('|');
+    String payload = (p2 >= 0) ? rest.substring(0, p2) : rest; // only the payload
+
+    // decryption
+    for (int i = 0; i < payload.length(); i++) {
+      char c = payload[i];
+      if (c >= 'A' && c <= 'Z') {
+        c = 'A' + (( (c - 'A') - 1 + 26) % 26);
+      } else if (c >= 'a' && c <= 'z') {
+        c = 'a' + (( (c - 'a') - 1 + 26) % 26);
+      }
+      payload.setCharAt(i, c);
+    }
+
+    // Otherwise handle message meant for me (decrypt if needed)
+    if (currentState == MeshState::Messaging) {
+      messagingGraphic();
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextSize(2);
+      tft.setCursor(0,tft.height() - 160);
+      tft.printf("Received for me:\n\n%s\nFrom: %s\nTime:%u\n", payload.c_str(), fromNode, millis());
+      tft.println();
+      tft.printf("Press LEFT to start over!\n");
+    }
+    if (currentState == MeshState::Comms) {
+      commsGraphic();
+      tft.setTextDatum(TL_DATUM);
+      tft.setTextSize(2);
+      tft.setCursor(0,tft.height() - 160);
+      tft.printf("Received for me:\n\n%s\nFrom: %s\nTime:%u\n", payload.c_str(), fromNode, millis());
+      tft.println();
+      tft.printf("Press LEFT to start over!\n");
+    }
+  }
+
+  void newConnectionCallback(uint32_t nodeId) {
+      //Serial.printf("New Connection --> nodeId = %u\n", nodeId);
+  }
+
+   void changedConnectionCallback() {
+    //Serial.printf("|------------------------------------Changed connections----------------------------------------------------|\n");
+    SimpleList<uint32_t> nodes = mesh.getNodeList();
+    for (auto id : nodes) {
+      //Serial.printf("Found node with ID: %u\n", id);
+    }
+  }
+
+  void nodeTimeAdjustedCallback(int32_t offset) { // timing for task scheduler
+      //Serial.printf("Adjusted time %u. Offset = %d\n", mesh.getNodeTime(),offset);
+  }
+
+  // Enable/disable on state change
+  void enableFor(MeshState s) { // enables states
+    if (s == MeshState::Messaging)    {
+      taskMessaging.enableIfNot();
+      messagingGraphic();
+      tft.setTextDatum(TL_DATUM); // resets cursor
+      tft.setTextSize(2);
+      tft.setCursor(0,tft.height() - 160);
+      tft.println("Press the Selection Button to send a \nmessage to Node 1");
+      tft.println("Press the Interact Button to send a \nmessage to Node 2");
+      digitalWrite(PIN_LED_MESSAGING, HIGH);
+    }
+    if (s == MeshState::Sniffer)      {
+      taskSniffer.enableIfNot();
+      snifferGraphic();
+      pinMode(PIN_INTER_IN_SNIFF_OUT, OUTPUT); // make pin output
+      digitalWrite(PIN_LED_SNIFFER, HIGH); 
+    }
+    if (s == MeshState::Comms)        {
+      taskComms.enableIfNot(); 
+      commsGraphic();
+      tft.setTextDatum(TL_DATUM); // resets cursor
+      tft.setTextSize(2);
+      tft.setCursor(0,tft.height() - 160);
+      tft.println("Press the Selection Button to send a \nmessage to Node 1");
+      tft.println("Press the Interact Button to send a \nmessage to Node 2");
+      digitalWrite(PIN_LED_COMMS, HIGH); 
+    }
+    if (s == MeshState::Interference) {
+      taskInterference.enableIfNot(); 
+      interferenceGraphic();
+      ledcAttachPin(PIN_SNIFF_IN_TX_OUT, IR_CH);// make pin output 
+      digitalWrite(PIN_LED_INTERFERENCE, HIGH);
+    }
+  }
+
+  void disableAllBut(MeshState s) { // disables usused states
+    if (s != MeshState::Messaging)    {
+      taskMessaging.disable(); 
+      digitalWrite(PIN_LED_MESSAGING, LOW);
+    }
+    if (s != MeshState::Sniffer)      {
+      taskSniffer.disable(); 
+      pinMode(PIN_INTER_IN_SNIFF_OUT, INPUT_PULLDOWN); 
+      digitalWrite(PIN_LED_SNIFFER, LOW); 
+    }
+    if (s != MeshState::Comms)        {
+      taskComms.disable();
+      digitalWrite(PIN_LED_COMMS, LOW); 
+    }
+    if (s != MeshState::Interference) {
+      taskInterference.disable();
+      ledcWrite(IR_CH, 0);  // ensure jammer off;
+      ledcDetachPin(PIN_SNIFF_IN_TX_OUT); // detach pin 
+      pinMode(PIN_SNIFF_IN_TX_OUT, INPUT_PULLDOWN); // make pin input again
+      digitalWrite(PIN_LED_INTERFERENCE, LOW);
+    }
+  }
+
+  // Applies requested state
+  void applyStateChange() { // Applies state selection
+    if (suppress.active) {
+      uint32_t now = millis();
+      if ((int32_t)(now - suppress.until) >= 0) { // time is up
+        suppress.active = false;
+        digitalWrite(LED_BRUH, LOW);
+        stateMachine();
+      } else {
+        // still in the window: force Idle
+        requestState = MeshState::Idle;
+      }
+    }
+    
+    MeshState desired = requestState; // read once (volatile)
+    if (desired == currentState) return; // Returns if no change is requested
+
+    disableAllBut(desired);
+    enableFor(desired);
+
+    lastApplied  = currentState;
+    currentState = desired;
+
+    const char* huh = "";
+
+    switch (currentState) { // Changes state
+      case MeshState::Messaging: huh = "Messaging"; break;
+      case MeshState::Sniffer: huh = "Sniffer"; break;
+      case MeshState::Comms: huh = "Comms"; break;
+      case MeshState::Interference: huh = "Interference"; break;
+      case MeshState::Idle: huh = "Idle"; break;
+    }
+  
+  }
+
+  void setup() {
+    delay(500); // Let's USB settle
+
+    mesh.setDebugMsgTypes( ERROR | STARTUP ); // set before init() so that you can see startup messages
+
+    mesh.init( MESH_PREFIX, MESH_PASSWORD, &userScheduler, MESH_PORT );
+    WiFi.setSleep(false);
+
+    mesh.setContainsRoot(true);
+    if (IS_ROOT) {
+      mesh.setRoot(true);
+    }
+
+    // PIN Setup
+    pinMode(PIN_TEST, INPUT_PULLDOWN);
+    pinMode(PIN_COMM_IN,  INPUT);
+    pinMode(PIN_SNIFF_IN_TX_OUT, INPUT_PULLDOWN);
+    pinMode(PIN_INTER_IN_SNIFF_OUT,   INPUT_PULLDOWN);
+    pinMode(PIN_INTERACT, INPUT_PULLDOWN);
+    pinMode(PIN_UP, INPUT_PULLDOWN);
+    pinMode(PIN_LEFT, INPUT_PULLDOWN);
+    pinMode(PIN_DOWN, INPUT_PULLDOWN);
+    pinMode(PIN_RIGHT, INPUT_PULLDOWN);
+    pinMode(PIN_SELECTION, INPUT_PULLDOWN);
+    pinMode(PIN_INTERACT, INPUT_PULLDOWN);
+
+    pinMode(PIN_AUD_RECIEVE_LED_SNIFFER, OUTPUT);
+    pinMode(LED_BRUH, OUTPUT);
+
+    pinMode(PIN_LED_INTERFERENCE, OUTPUT);
+    pinMode(PIN_LED_MESSAGING, OUTPUT);
+    pinMode(PIN_LED_SNIFFER, OUTPUT); 
+    pinMode(PIN_LED_COMMS, OUTPUT);
+
+    pinMode(IR_RX_PIN, INPUT);
+    attachInterrupt(IR_RX_PIN, onIrEdge, FALLING);
+
+    ledcSetup(IR_CH, 38000, 8);     // 38 kHz, 8-bit
+    ledcWrite(IR_CH, 0);            // idle off
+
+    // LCD Setup
+    tft.init();
+    pinMode(TFT_BL, OUTPUT);
+    digitalWrite(TFT_BL, HIGH);  // backlight ON
+    tft.setRotation(3);            // landscape
+    tft.fillScreen(TFT_BLACK); 
+
+    tft.setSwapBytes(true);
+    W = VAST_480x320_WIDTH;
+    H = VAST_480x320_HEIGHT;
+    x = (tft.width()  - W) / 2;   // center horizontally (480-280)/2 = 100
+    y = (tft.height() - H) / 2;   // center vertically   (320-280)/2 = 20
+
+    tft.pushImage(x, y, W, H, VAST_480x320);
+
+    tft.setTextSize(2);
+    tft.setCursor(0, 0);
+    tft.println("VAST Networx presents:");
+    tft.println("--------------------");
+    tft.println("VASTlink");
+    tft.println("");
+    tft.println("You are Node 3");
+    tft.println("Press LEFT to continue");
+
+    mesh.onReceive(&receivedCallback);
+    mesh.onNewConnection(&newConnectionCallback);
+    mesh.onChangedConnections(&changedConnectionCallback);
+    mesh.onNodeTimeAdjusted(&nodeTimeAdjustedCallback);
+
+    userScheduler.addTask(taskMessaging);
+    userScheduler.addTask(taskSniffer);
+    userScheduler.addTask(taskComms);
+    userScheduler.addTask(taskInterference);
+    userScheduler.addTask(taskIrCheck);
+    taskIrCheck.enable(); // Opens interference to always be read
+  }
+  
+  int check = 0;
+
+  void loop() {
+    mesh.update();
+    if (check == 0) {
+      if (digitalRead(PIN_LEFT)) {
+        requestState = MeshState::Messaging;
+        check = 1;
+      }
+      return;
+    }
+    userScheduler.execute(); // Important to call this to run the tasks
+    stateMachine();
+    applyStateChange(); // Implements state machine logic
+  }
